@@ -252,19 +252,17 @@ def create_cuda_stream():
 
 
 async def open_remote_rmm_block(executer, ipc_handle):
-    ret = cuda.cudadrv.drvapi.cu_device_ptr()
-
     def _run():
+        ret = cuda.cudadrv.drvapi.cu_device_ptr()
         cuda.get_current_device().get_primary_context().push()
         cuda.cudadrv.driver.driver.cuIpcOpenMemHandle(ctypes.byref(ret), ipc_handle, 1)
+        return (ret, create_cuda_stream())
 
-    await asyncio.get_event_loop().run_in_executor(executer, _run)
-    return ret
+    return await asyncio.get_event_loop().run_in_executor(executer, _run)
 
 
-async def cuda_copy(executer, dst, src, nbytes):
+async def cuda_copy(executer, dst, src, nbytes, stream):
     def _run():
-        stream = create_cuda_stream()
         cuda.cudadrv.driver.driver.cuMemcpyDtoDAsync(dst, src, nbytes, stream)
         cuda.cudadrv.driver.driver.cuStreamSynchronize(stream)
 
@@ -407,12 +405,13 @@ class Endpoint:
                     max_workers=1, thread_name_prefix="nvlink-thread"
                 )
                 # Open remote RMM memory block
-                remote_rmm_block = await open_remote_rmm_block(
+                (remote_rmm_block, stream) = await open_remote_rmm_block(
                     executer, ipc_handle["handle"]
                 )
                 self._ep._ctx.remote_rmm_allocs[remote_rmm_alloc_hash] = {
                     "ptr": remote_rmm_block,
                     "executer": executer,
+                    "stream": stream,
                 }
             else:
                 remote_rmm_block = self._ep._ctx.remote_rmm_allocs[
@@ -420,6 +419,9 @@ class Endpoint:
                 ]["ptr"]
                 executer = self._ep._ctx.remote_rmm_allocs[remote_rmm_alloc_hash][
                     "executer"
+                ]
+                stream = self._ep._ctx.remote_rmm_allocs[remote_rmm_alloc_hash][
+                    "stream"
                 ]
 
             remote_ary_mem = remote_rmm_block.value + ipc_handle["ary_offset"]
@@ -430,6 +432,7 @@ class Endpoint:
                 buffer.__cuda_array_interface__["data"][0],
                 remote_ary_mem,
                 mem_nbytes,
+                stream,
             )
 
             # cuda.cudadrv.driver.driver.cuMemcpyDtoD(
