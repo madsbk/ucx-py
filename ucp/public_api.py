@@ -241,6 +241,34 @@ import pickle
 from numba import cuda
 import rmm
 import ctypes
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+
+def create_cuda_stream():
+    ret = cuda.cudadrv.drvapi.cu_stream()
+    cuda.cudadrv.driver.driver.cuStreamCreate(ctypes.byref(ret), 1)  # CU_STREAM_NON_BLOCKING
+    return ret
+
+
+async def open_remote_rmm_block(executer, ipc_handle):
+    ret = cuda.cudadrv.drvapi.cu_device_ptr()
+
+    def _run():
+        cuda.get_current_device().get_primary_context().push()
+        cuda.cudadrv.driver.driver.cuIpcOpenMemHandle(ctypes.byref(ret), ipc_handle, 1)
+
+    await asyncio.get_event_loop().run_in_executor(executer, _run)
+    return ret
+
+
+async def cuda_copy(executer, dst, src, nbytes):
+    def _run():
+        stream = create_cuda_stream()
+        cuda.cudadrv.driver.driver.cuMemcpyDtoDAsync(dst, src, nbytes, stream)
+        cuda.cudadrv.driver.driver.cuStreamSynchronize(stream)
+
+    await asyncio.get_event_loop().run_in_executor(executer, _run)
 
 
 def is_rmm_alloc(mem_ptr):
@@ -274,7 +302,7 @@ def pickle_ipc_handle(rmm_mem_ptr, nbytes):
 def unpickle_ipc_handle(buffer):
     ret = pickle.loads(buffer)
     ret["handle"] = cuda.cudadrv.drvapi.cu_ipc_mem_handle(*ret["handle"])
-    #print("unpickle_ipc_handle: ", ret)
+    # print("unpickle_ipc_handle: ", ret)
     return ret
 
 
@@ -329,7 +357,11 @@ class Endpoint:
         """
 
         ipc_handle = None
-        if self._ep._ctx.own_cuda_ipc and self._ep.peer_extra_info["cuda_direct_peer_access"] and hasattr(buffer, "__cuda_array_interface__"):
+        if (
+            self._ep._ctx.own_cuda_ipc
+            and self._ep.peer_extra_info["cuda_direct_peer_access"]
+            and hasattr(buffer, "__cuda_array_interface__")
+        ):
             data, _ = buffer.__cuda_array_interface__["data"]
             if is_rmm_alloc(data):
                 import cupy
@@ -368,32 +400,51 @@ class Endpoint:
             assert ipc_handle["ary_nbytes"] == core.get_buffer_nbytes(
                 buffer, False, True
             )
-            ctx = cuda.get_current_device().get_primary_context()
-            ctx.push()
+
             remote_rmm_alloc_hash = hash(tuple(ipc_handle["handle"]))
             if remote_rmm_alloc_hash not in self._ep._ctx.remote_rmm_allocs:
-                # Open remote RMM memory block
-                remote_rmm_block = cuda.cudadrv.drvapi.cu_device_ptr()
-                cuda.cudadrv.driver.driver.cuIpcOpenMemHandle(
-                    ctypes.byref(remote_rmm_block), ipc_handle["handle"], 1
+                executer = ThreadPoolExecutor(
+                    max_workers=1, thread_name_prefix="nvlink-thread"
                 )
-                self._ep._ctx.remote_rmm_allocs[
-                    remote_rmm_alloc_hash
-                ] = remote_rmm_block
+                # Open remote RMM memory block
+                remote_rmm_block = await open_remote_rmm_block(
+                    executer, ipc_handle["handle"]
+                )
+                self._ep._ctx.remote_rmm_allocs[remote_rmm_alloc_hash] = {
+                    "ptr": remote_rmm_block,
+                    "executer": executer,
+                }
             else:
                 remote_rmm_block = self._ep._ctx.remote_rmm_allocs[
                     remote_rmm_alloc_hash
+                ]["ptr"]
+                executer = self._ep._ctx.remote_rmm_allocs[remote_rmm_alloc_hash][
+                    "executer"
                 ]
 
             remote_ary_mem = remote_rmm_block.value + ipc_handle["ary_offset"]
             mem_nbytes = ipc_handle["ary_nbytes"]
 
-            cuda.cudadrv.driver.driver.cuMemcpyDtoD(
-                 buffer.__cuda_array_interface__["data"][0], remote_ary_mem, mem_nbytes
+            await cuda_copy(
+                executer,
+                buffer.__cuda_array_interface__["data"][0],
+                remote_ary_mem,
+                mem_nbytes,
             )
-            ctx.pop()
+
+            # cuda.cudadrv.driver.driver.cuMemcpyDtoD(
+            #      buffer.__cuda_array_interface__["data"][0], remote_ary_mem, mem_nbytes
+            # )
 
             # TODO: can we do this async?
+            # cuda.cudadrv.driver.driver.cuMemcpyDtoDAsync(
+            #     buffer.__cuda_array_interface__["data"][0], remote_ary_mem, mem_nbytes, 0
+            # )
+            # import asyncio
+            # await asyncio.sleep(0)
+            # cuda.cudadrv.driver.driver.cuStreamSynchronize(0)
+
+            # print("DtoD copy")
             await self._ep.send(bytearray(1))
             # cuda.cudadrv.driver.driver.cuIpcCloseMemHandle(remote_ary_mem)
 

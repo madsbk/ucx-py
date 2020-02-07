@@ -173,9 +173,10 @@ async def exchange_cuda_device_info(ep):
     """
     try:
         import numba
-        cuda_device_info = numba.cuda.get_current_device().get_device_identity()
     except ImportError:
         cuda_device_info = None
+    else:
+        cuda_device_info = numba.cuda.get_current_device().get_device_identity()
 
     ep.peer_extra_info.update(
         await exchange_extra_peer_info(
