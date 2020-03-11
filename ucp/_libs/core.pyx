@@ -2,12 +2,12 @@
 # See file LICENSE for terms.
 # cython: language_level=3
 
-import os
 import asyncio
 import weakref
 from functools import partial
 from libc.stdint cimport uint64_t, uintptr_t
 from random import randint
+from os import close as close_fd, environ
 import psutil
 import uuid
 import socket
@@ -23,6 +23,7 @@ from ..exceptions import (
 
 from .send_recv import tag_send, tag_recv, stream_send, stream_recv, log_errors
 from .utils import get_buffer_nbytes
+from . import ucx_api
 
 
 cdef assert_ucs_status(ucs_status_t status, msg_context=None):
@@ -30,68 +31,6 @@ cdef assert_ucs_status(ucs_status_t status, msg_context=None):
         msg = "[%s] " % msg_context if msg_context is not None else ""
         msg += ucs_status_string(status).decode("utf-8")
         raise UCXError(msg)
-
-
-cdef ucp_config_t * read_ucx_config(dict user_options) except *:
-    """
-    Reads the UCX config and returns a config handle,
-    which should freed using `ucp_config_release()`.
-    """
-    cdef ucp_config_t *config
-    cdef ucs_status_t status
-    status = ucp_config_read(NULL, NULL, &config)
-    if status != UCS_OK:
-        raise UCXConfigError(
-            "Couldn't read the UCX options: %s" %
-            ucs_status_string(status).decode("utf-8")
-        )
-
-    # Modify the UCX configuration options based on `config_dict`
-    for k, v in user_options.items():
-        status = ucp_config_modify(config, k.encode(), v.encode())
-        if status == UCS_ERR_NO_ELEM:
-            raise UCXConfigError("Option %s doesn't exist" % k)
-        elif status != UCS_OK:
-            msg = "Couldn't set option %s to %s: %s" % \
-                  (k, v, ucs_status_string(status).decode("utf-8"))
-            raise UCXConfigError(msg)
-    return config
-
-
-cdef get_ucx_config_options(ucp_config_t *config):
-    """Returns a dict of the UCX config options"""
-    cdef char *text
-    cdef size_t text_len
-    cdef FILE *text_fd = open_memstream(&text, &text_len)
-    assert(text_fd != NULL)
-    ret = {}
-    ucp_config_print(config, text_fd, NULL, UCS_CONFIG_PRINT_CONFIG)
-    fflush(text_fd)
-    cdef unicode py_text = text.decode()
-    for line in py_text.splitlines():
-        k, v = line.split("=")
-        k = k[len("UCX_"):]
-        ret[k] = v
-    fclose(text_fd)
-    free(text)
-    return ret
-
-
-def get_config():
-    """
-    Returns the current UCX options
-    if UCX were to be initialized now.
-    """
-    cdef ucp_config_t *config = read_ucx_config({})
-    ret = get_ucx_config_options(config)
-    ucp_config_release(config)
-    return ret
-
-
-def get_ucx_version():
-    cdef unsigned int a, b, c
-    ucp_get_version(&a, &b, &c)
-    return (a, b, c)
 
 
 cdef struct _listener_callback_args:
@@ -308,104 +247,40 @@ cdef class _Listener:
         self._ctx = None
 
 
-cdef class ApplicationContext:
-    cdef:
-        object __weakref__
-        ucp_context_h context
-        # For now, a application context only has one worker
-        ucp_worker_h worker
-        int epoll_fd
-        object event_loops_binded_for_progress
-        object progress_tasks
-        bint initiated
-        bint blocking_progress_mode
-        object dangling_arm_task
-
-    cdef public:
-        object config
-
-    def __cinit__(self, config_dict={}, blocking_progress_mode=None):
-        cdef ucp_params_t ucp_params
-        cdef ucp_worker_params_t worker_params
-        cdef ucs_status_t status
+class ApplicationContext:
+    def __init__(self, config_dict={}, blocking_progress_mode=None):
         self.event_loops_binded_for_progress = set()
         self.progress_tasks = []
-        self.config = {}
-        self.initiated = False
         self.dangling_arm_task = None
-
+        self.epoll_fd = -1
+        self._ctx = None
+        self._worker = None
         if blocking_progress_mode is not None:
             self.blocking_progress_mode = blocking_progress_mode
-        elif 'UCXPY_NON_BLOCKING_MODE' in os.environ:
+        elif "UCXPY_NON_BLOCKING_MODE" in environ:
             self.blocking_progress_mode = False
         else:
             self.blocking_progress_mode = True
 
-        self.config['VERSION'] = get_ucx_version()
+        # Create context and worker, which might fail
+        self._ctx = ucx_api.UCXContext(config_dict)
+        self._worker = ucx_api.UCXWorker(self._ctx)
 
-        memset(&ucp_params, 0, sizeof(ucp_params))
-        ucp_params.field_mask = (UCP_PARAM_FIELD_FEATURES |  # noqa
-                                 UCP_PARAM_FIELD_REQUEST_SIZE |  # noqa
-                                 UCP_PARAM_FIELD_REQUEST_INIT)
-
-        # We always request UCP_FEATURE_WAKEUP even when in blocking mode
-        # See <https://github.com/rapidsai/ucx-py/pull/377>
-        ucp_params.features = (UCP_FEATURE_TAG |  # noqa
-                               UCP_FEATURE_WAKEUP |  # noqa
-                               UCP_FEATURE_STREAM)
-
-        ucp_params.request_size = sizeof(ucp_request)
-        ucp_params.request_init = (
-            <ucp_request_init_callback_t>ucp_request_reset
-        )
-
-        cdef ucp_config_t *config = read_ucx_config(config_dict)
-        status = ucp_init(&ucp_params, config, &self.context)
-        assert_ucs_status(status)
-
-        worker_params.field_mask = UCP_WORKER_PARAM_FIELD_THREAD_MODE
-        worker_params.thread_mode = UCS_THREAD_MODE_MULTI
-        status = ucp_worker_create(self.context, &worker_params, &self.worker)
-        assert_ucs_status(status)
-
-        # In blocking progress mode, we create an epoll file
-        # descriptor that we can wait on later.
-        cdef int ucp_epoll_fd
-        cdef epoll_event ev
-        cdef int err
         if self.blocking_progress_mode:
-            status = ucp_worker_get_efd(self.worker, &ucp_epoll_fd)
-            assert_ucs_status(status)
-            self.progress()
-            status = ucp_worker_arm(self.worker)
-            assert_ucs_status(status)
+            self.epoll_fd = self._worker.init_blocking_progress_mode()
 
-            self.epoll_fd = epoll_create(1)
-            assert(self.epoll_fd != -1)
-            ev.data.fd = ucp_epoll_fd
-            ev.events = EPOLLIN
-            err = epoll_ctl(self.epoll_fd, EPOLL_CTL_ADD, ucp_epoll_fd, &ev)
-            assert(err == 0)
-
-        self.config = get_ucx_config_options(config)
-        ucp_config_release(config)
-
-        logging.info("UCP initiated using config: ")
-        for k, v in self.config.items():
-            logging.info("  %s: %s" % (k, v))
-
-        self.initiated = True
-
-    def __dealloc__(self):
-        if self.initiated:
-            for task in self.progress_tasks:
-                task.cancel()
-            if self.dangling_arm_task is not None:
-                self.dangling_arm_task.cancel()
-            ucp_worker_destroy(self.worker)
-            ucp_cleanup(self.context)
-            if self.blocking_progress_mode:
-                close(self.epoll_fd)
+    def __del__(self):
+        for task in self.progress_tasks:
+            task.cancel()
+        if self.dangling_arm_task is not None:
+            self.dangling_arm_task.cancel()
+        # Notice, worker and context might never have been created
+        if self._worker is not None:
+            self._worker.destroy()
+        if self._ctx is not None:
+            self._ctx.destroy()
+        if self.blocking_progress_mode and self.epoll_fd != -1:
+            close_fd(self.epoll_fd)
 
     def create_listener(self, callback_func, port, guarantee_msg_order):
         from ..public_api import Listener
@@ -432,7 +307,7 @@ cdef class ApplicationContext:
         ret._port = port
         ret._ctx = self
 
-        ret._cb_args.ucp_worker = self.worker
+        ret._cb_args.ucp_worker = <ucp_worker_h><uintptr_t>self._worker.handle
         ret._cb_args.py_func = <PyObject*> callback_func
         ret._cb_args.py_ctx = <PyObject*> self
         ret._cb_args.guarantee_msg_order = guarantee_msg_order
@@ -451,7 +326,7 @@ cdef class ApplicationContext:
 
         logging.info("create_listener() - Start listening on port %d" % port)
         cdef ucs_status_t status = ucp_listener_create(
-            self.worker, &params, &ret._ucp_listener
+            <ucp_worker_h><uintptr_t>self._worker.handle, &params, &ret._ucp_listener
         )
         c_util_get_ucp_listener_params_free(&params)
         assert_ucs_status(status)
@@ -467,7 +342,7 @@ cdef class ApplicationContext:
             raise MemoryError("Failed allocation of ucp_ep_params_t")
 
         cdef ucp_ep_h ucp_ep
-        cdef ucs_status_t status = ucp_ep_create(self.worker, &params, &ucp_ep)
+        cdef ucs_status_t status = ucp_ep_create(<ucp_worker_h><uintptr_t>self._worker.handle, &params, &ucp_ep)
         c_util_get_ucp_ep_params_free(&params)
         assert_ucs_status(status)
 
@@ -486,7 +361,7 @@ cdef class ApplicationContext:
         )
         ep = _Endpoint(
             ucp_endpoint=int(<uintptr_t><void*>ucp_ep),
-            ucp_worker=int(<uintptr_t><void*>self.worker),
+            ucp_worker=self._worker.handle,
             ctx=self,
             msg_tag_send=peer_info['msg_tag'],
             msg_tag_recv=msg_tag,
@@ -515,12 +390,13 @@ cdef class ApplicationContext:
         return pub_ep
 
     def progress(self):
-        while ucp_worker_progress(self.worker) != 0:
+        while ucp_worker_progress(<ucp_worker_h><uintptr_t>self._worker.handle) != 0:
             pass
 
     def _blocking_progress_mode(self, event_loop):
         """Bind an asyncio reader to a UCX epoll file descripter"""
         assert self.blocking_progress_mode is True
+        assert self.epoll_fd != -1
 
         # Creating a job that is ready straightaway but with low priority.
         # Calling `await event_loop.sock_recv(rsock, 1)` will return when
@@ -540,7 +416,7 @@ cdef class ApplicationContext:
             await event_loop.sock_recv(rsock, 1)
 
             while True:
-                status = ucp_worker_arm(self.worker)
+                status = ucp_worker_arm(<ucp_worker_h><uintptr_t>self._worker.handle)
                 if status == UCS_ERR_BUSY:
                     self.progress()
                     await event_loop.sock_recv(rsock, 1)
@@ -578,14 +454,15 @@ cdef class ApplicationContext:
             self._non_blocking_progress_mode(loop)
 
     def get_ucp_worker(self):
-        return int(<uintptr_t><void*>self.worker)
+        return self._worker.handle
 
     def get_config(self):
-        return self.config
+        return self._ctx.get_config()
 
     def unbind_epoll_fd_to_event_loop(self):
         for loop in self.event_loops_binded_for_progress:
-            loop.remove_reader(self.epoll_fd)
+            if self.epoll_fd != -1:
+                loop.remove_reader(self.epoll_fd)
 
 
 class _Endpoint:
@@ -619,7 +496,8 @@ class _Endpoint:
         self._closed = False
         self.pending_msg_list = []
         # UCX supports CUDA if "cuda" is part of the TLS or TLS is "all"
-        self._cuda_support = "cuda" in ctx.config['TLS'] or ctx.config['TLS'] == "all"
+        tls = ctx.get_config()["TLS"]
+        self._cuda_support = "cuda" in tls or tls == "all"
         self._close_after_n_recv = None
 
     @property
